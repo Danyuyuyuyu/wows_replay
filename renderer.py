@@ -197,7 +197,6 @@ class RenderSettings:
     primary_stat: tuple[int, int] | None
     cpu_stat: tuple[int, int] | None
     toolkit_version: str | None
-    data_identity: str
     show_player_names: bool
     extra_args: tuple[str, ...]
     auto_cpu_fallback: bool
@@ -222,7 +221,6 @@ def render_settings() -> RenderSettings:
         primary_stat=_binary_stat(primary),
         cpu_stat=_binary_stat(cpu),
         toolkit_version=config.installed_toolkit_version(),
-        data_identity=getattr(config, "data_identity", lambda: "")(),
         show_player_names=config.show_player_names(),
         extra_args=tuple(shlex.split(config.extra_args().strip())),
         auto_cpu_fallback=config.auto_cpu_fallback(),
@@ -231,15 +229,19 @@ def render_settings() -> RenderSettings:
 
 
 def cache_signature(settings: RenderSettings | None = None) -> str:
+    """渲染配置签名：用于任务去重和缓存分目录。
+
+    游戏数据不在这里：它只能在探测出 replay 版本后确定，由 worker 按版本
+    单独拼进缓存文件名（见 worker._cache_path）。
+    """
     settings = settings or render_settings()
     payload = {
-        "schema": 2,
+        "schema": 3,
         "primary": str(settings.primary),
         "cpu": str(settings.cpu),
         "primary_stat": settings.primary_stat,
         "cpu_stat": settings.cpu_stat,
         "toolkit_version": settings.toolkit_version,
-        "data_identity": settings.data_identity,
         "show_player_names": settings.show_player_names,
         "extra_args": settings.extra_args,
         "auto_cpu_fallback": settings.auto_cpu_fallback,

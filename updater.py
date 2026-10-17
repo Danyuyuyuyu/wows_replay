@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import os
@@ -59,6 +61,9 @@ _upstream_cache: "tuple[float, list[str]] | None" = None
 _install_failed: "dict[str, float]" = {}
 _check_lock = asyncio.Lock()
 _data_src_lock = asyncio.Lock()
+# 渲染读取 DATA_DIR 时持有；裁剪旧版本也要拿到它，避免删掉正在被读的数据。
+# 补数据只新增目录和内容对象，不需要这把锁，所以下载期间渲染可以照常进行。
+_data_use_lock = asyncio.Lock()
 
 
 @dataclass
@@ -155,6 +160,13 @@ def proxy() -> str | None:
 async def data_source_lock():
     """Serialize operations that mutate the shared source checkout."""
     async with _data_src_lock:
+        yield
+
+
+@asynccontextmanager
+async def data_in_use():
+    """Hold while reading installed data; pruning waits until it is released."""
+    async with _data_use_lock:
         yield
 
 
@@ -324,12 +336,16 @@ def _tools_asset(assets: list) -> dict | None:
     return None
 
 
-async def _download_file(url: str, dest: Path, *, max_bytes: int | None = None) -> None:
-    """流式下载，避免把几十 MB 一次性读进内存；max_bytes 给下载包兜个上限。"""
+async def _download_file(url: str, dest: Path, *, max_bytes: int | None = None) -> str:
+    """流式下载，避免把几十 MB 一次性读进内存；max_bytes 给下载包兜个上限。
+
+    返回下载内容的 sha256（十六进制）。
+    """
     from . import downloader
 
     client, owned = downloader.acquire_client()
     written = 0
+    hasher = hashlib.sha256()
     try:
         async with client.stream("GET", url, follow_redirects=True) as response:
             response.raise_for_status()
@@ -351,10 +367,21 @@ async def _download_file(url: str, dest: Path, *, max_bytes: int | None = None) 
                         raise ValueError(
                             f"下载超过上限 {max_bytes / 1e6:.0f}MB，已中止"
                         )
+                    hasher.update(chunk)
                     fh.write(chunk)
     finally:
         if owned:
             await client.aclose()
+    return hasher.hexdigest()
+
+
+def _expected_sha256(asset: dict) -> str | None:
+    """GitHub release asset 的 ``digest`` 字段（形如 ``sha256:<hex>``）。"""
+    digest = str(asset.get("digest") or "").strip().lower()
+    algorithm, _, value = digest.partition(":")
+    if algorithm == "sha256" and re.fullmatch(r"[0-9a-f]{64}", value):
+        return value
+    return None
 
 
 def _safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
@@ -418,11 +445,21 @@ async def stage_toolkit(release: dict) -> Path | None:
     moved_old = False
     promoted = False
     try:
-        await _download_file(
+        actual_sha256 = await _download_file(
             str(asset["browser_download_url"]),
             archive_tmp,
             max_bytes=MAX_TOOLKIT_MB * 1024 * 1024,
         )
+        expected_sha256 = _expected_sha256(asset)
+        if expected_sha256 is None:
+            logger.warning(
+                f"{tag} 的 tools 包没有提供 sha256，仅做压缩包 CRC 校验",
+                "wows_replay",
+            )
+        elif actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"tools 包 sha256 不匹配：期望 {expected_sha256}，实际 {actual_sha256}"
+            )
         partial.mkdir()
         with zipfile.ZipFile(archive_tmp) as zf:
             bad_member = zf.testzip()
@@ -722,9 +759,22 @@ def _downloaded_recently(directory: Path, deadline: float) -> bool:
 
 
 async def prune_data(protected: set[str] | None = None) -> None:
-    """裁剪旧版本；protected 里的版本先保留给当前 replay 使用。"""
-    async with _data_src_lock:
+    """裁剪旧版本；protected 里的版本先保留给当前 replay 使用。
+
+    先等正在进行的渲染读完数据（_data_use_lock），再动 DATA_DIR。
+    """
+    async with _data_src_lock, _data_use_lock:
         await _await_thread(_prune_data_sync, protected)
+
+
+TRASH_PREFIX = ".trash-"
+
+
+def _purge_trash(out: Path) -> None:
+    """删掉上次没删干净的回收目录（文件被占用等原因）。"""
+    for item in out.iterdir():
+        if item.is_dir() and item.name.startswith(TRASH_PREFIX):
+            shutil.rmtree(item, ignore_errors=True)
 
 
 def _prune_data_sync(protected: set[str] | None = None) -> None:
@@ -736,7 +786,10 @@ def _prune_data_sync(protected: set[str] | None = None) -> None:
     keep = config.max_data_versions()
     grace_days = config.data_grace_days()
     out = config.data_dir()
-    if keep <= 0 or not out.is_dir():
+    if not out.is_dir():
+        return
+    _purge_trash(out)
+    if keep <= 0:
         return
 
     dirs = [
@@ -768,10 +821,24 @@ def _prune_data_sync(protected: set[str] | None = None) -> None:
     if not dropped:
         return
 
+    removed_any = False
     for directory in dropped:
-        shutil.rmtree(directory, ignore_errors=True)
+        # 先整体改名移出版本命名空间：改名是原子的，失败就原样保留该版本
+        # （并继续保留它引用的内容对象），不会留下「目录还在、数据被删一半」的残缺版本。
+        trash = out / f"{TRASH_PREFIX}{directory.name}-{uuid.uuid4().hex[:8]}"
+        try:
+            directory.replace(trash)
+        except OSError as e:
+            logger.warning(
+                f"无法移除旧版本 {directory.name}，本次先保留: {e}", "wows_replay"
+            )
+            kept.append(directory)
+            continue
+        removed_any = True
+        shutil.rmtree(trash, ignore_errors=True)
         logger.info(f"清理旧版本数据 {directory.name}", "wows_replay")
-    _prune_common(out, kept)
+    if removed_any:
+        _prune_common(out, kept)
 
 
 def _superuser_ids() -> list[str]:
@@ -919,6 +986,34 @@ async def notify_superusers(text: str) -> None:
         _queue_notice(text)
 
 
+def _notice_fingerprint(report: UpdateReport) -> str:
+    """通知内容的指纹；与上次相同就不再重复私聊超管。"""
+    if not report.has_update:
+        return ""
+    payload = {
+        "new_versions": list(report.new_versions),
+        "staged": report.toolkit_latest if report.staged else None,
+        "errors": sorted(report.errors),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _read_last_notice() -> str:
+    try:
+        return config.LAST_NOTICE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _write_last_notice(fingerprint: str) -> None:
+    try:
+        config.LAST_NOTICE_FILE.write_text(fingerprint, encoding="utf-8")
+    except OSError as e:
+        logger.debug(f"写入通知指纹失败: {e}", "wows_replay")
+
+
 def _report_text(report: UpdateReport) -> str:
     return messages.update_report(
         new_versions=report.new_versions,
@@ -938,10 +1033,20 @@ async def scheduled_check() -> None:
         except Exception as e:
             logger.error("更新检查失败", "wows_replay", e=e)
             return
-        if report.has_update:
-            await notify_superusers(_report_text(report))
-        else:
+        fingerprint = _notice_fingerprint(report)
+        if not report.has_update:
             logger.info("更新检查：本地已是最新", "wows_replay")
+        elif fingerprint == _read_last_notice():
+            # 已暂存的工具、没人用到的新数据版本、持续的同一个错误，每天都会出现在
+            # 报告里；内容没变就只写日志，不再每天私聊一遍。
+            logger.info(
+                "更新检查：结果与上次通知相同，不重复通知: "
+                + _report_text(report).replace("\n", " | "),
+                "wows_replay",
+            )
+        else:
+            await notify_superusers(_report_text(report))
+        _write_last_notice(fingerprint)
         # 之前因为没有在线连接而挂起的通知，借这次检查再试一次
         await flush_pending_notifications()
 

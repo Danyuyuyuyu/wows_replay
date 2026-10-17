@@ -32,6 +32,11 @@ class DataService:
         return self.backend.proxy()
 
     @asynccontextmanager
+    async def in_use(self):
+        async with self.backend.data_in_use():
+            yield
+
+    @asynccontextmanager
     async def source_lock(self):
         async with self.backend.data_source_lock():
             yield

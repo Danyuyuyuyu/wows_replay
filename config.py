@@ -45,6 +45,7 @@ DELIVERY_DIR = WORK_DIR / "deliveries"
 TEMP_DIR = WORK_DIR / "temp"
 QUEUE_DIR = WORK_DIR / "queue"
 LAST_CHECK_FILE = WORK_DIR / "last_update_check"
+LAST_NOTICE_FILE = WORK_DIR / "last_update_notice"
 
 for _path in (WORK_DIR, INBOX_DIR, OUTPUT_DIR, CACHE_DIR, DELIVERY_DIR, TEMP_DIR, QUEUE_DIR):
     _path.mkdir(parents=True, exist_ok=True)
@@ -464,28 +465,29 @@ def available_versions() -> list[str]:
     )
 
 
-def data_identity() -> str:
-    """Return a stable identity for the currently materialized game data."""
-    rows: list[str] = []
-    root = data_dir()
-    for name in available_versions():
-        version_dir = root / name
-        rows.append(name)
-        for filename in ("metadata.toml", "game_params.rkyv"):
-            path = version_dir / filename
+def version_data_identity(version_dir: str) -> str:
+    """Identity of one installed data version, used to key its rendered videos.
+
+    Only the version a replay actually renders with is included, so installing
+    or pruning other versions no longer invalidates every cached video.
+    """
+    path_root = data_dir() / version_dir
+    rows: list[str] = [version_dir]
+    for filename in ("metadata.toml", "game_params.rkyv"):
+        path = path_root / filename
+        try:
+            stat = path.stat()
+        except OSError:
+            rows.append(f"{filename}:missing")
+            continue
+        if filename == "metadata.toml":
             try:
-                stat = path.stat()
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
-                rows.append(f"{filename}:missing")
-                continue
-            if filename == "metadata.toml":
-                try:
-                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                except OSError:
-                    digest = "unreadable"
-                rows.append(f"{filename}:{digest}")
-            else:
-                rows.append(f"{filename}:{stat.st_size}:{stat.st_mtime_ns}")
+                digest = "unreadable"
+            rows.append(f"{filename}:{digest}")
+        else:
+            rows.append(f"{filename}:{stat.st_size}:{stat.st_mtime_ns}")
     return hashlib.sha256(chr(10).join(rows).encode("utf-8")).hexdigest()
 
 
