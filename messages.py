@@ -86,6 +86,11 @@ def video_send_failed(reason: object) -> str:
     return f"视频已生成，但发送失败：{brief_error(reason)}"
 
 
+def video_send_uncertain() -> str:
+    """协议端超时：视频可能仍在上传，别再自动重发一份。"""
+    return "视频发送超时，可能仍在上传；稍后没收到的话再传一次回放即可直接复用成品。"
+
+
 def status_lines(enabled: bool, queue: int, health: list[str]) -> list[str]:
     lines = [
         f"{_who()}的 wowsreplay 解析：{'启用中~' if enabled else '已经关掉了哦'}",

@@ -39,7 +39,7 @@ __plugin_meta__ = PluginMetadata(
     ),
     extra=PluginExtraData(
         author="zhenxun-user",
-        version="1.5",
+        version="1.6",
         commands=[Command(command="wowsreplay")],
     ).to_dict(),
 )
